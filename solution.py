@@ -1,201 +1,259 @@
-"""Sokoban solver: tim kiem theo CU DAY (push), A* co trong so.
+"""Sokoban solver: tìm kiếm theo CÚ ĐẨY (push), dùng A* có trọng số.
 
-Y tuong:
-  1. Moi node = 1 cu day thung. Robot di toi cho dung bang BFS (chi phi = so buoc di + 1).
-  2. Tinh truoc "o chet" (thung khong the keo toi dich) bang BFS nguoc tu o dich.
-  3. h = gan cap thung-dich chi phi nho nhat (khoang cach day that, co cache).
-  4. Tim xong thi PHAT LAI cac nuoc di qua successors() de co chuoi parent hop le.
+Ý tưởng:
+  1. Mỗi node tìm kiếm = 1 cú đẩy thùng. Robot đi tới chỗ đứng đẩy bằng BFS
+     (chi phí cú đẩy = số bước đi + 1).
+  2. Tính trước "ô chết" (thùng nằm đó thì không bao giờ về được đích) bằng BFS ngược từ ô đích.
+  3. Heuristic = ghép cặp thùng-đích có tổng khoảng cách đẩy nhỏ nhất (có cache).
+  4. Tìm xong thì PHÁT LẠI các nước đi qua successors() để có chuỗi parent hợp lệ.
+
+Chạy thử và in đường đi:
+    py solution.py 19          # giải bài số 19 trong PROBLEMS, in từng bước
+    py solution.py 19 map      # in thêm bản đồ sau mỗi bước
 """
 import heapq
+import sys
 import time
-from collections import deque
+from collections import deque, namedtuple
 from itertools import count
 
 from sokoban import sokoban_goal_state
+FAST_W = 3                  # lượt đầu: W lớn -> ra lời giải nhanh 
+REFINE_W = (2.5, 2, 1.5, 1)   # các lượt tinh chỉnh: W nhỏ dần (W = 1 là tối ưu)
+REFINE = 3                  # số giây tối đa để tinh chỉnh (0 = chỉ lấy lượt nhanh)
 
-FAST_W = 3                              # luot dau: nhanh
-REFINE_W = (2.5, 2, 1.5, 1)                # cac luot tinh chinh (W=1: toi uu)
-REFINE = 3                              # so giay toi da de tinh chinh (dat 0 = chi lay luot nhanh)
-DIRS = (("up", 0, -1), ("right", 1, 0), ("down", 0, 1), ("left", -1, 0))
-INF = 10 ** 9
+DIRECTIONS = (("up", 0, -1), ("right", 1, 0), ("down", 0, 1), ("left", -1, 0))
+INFINITY = 10 ** 9
+
+# Một node tìm kiếm: vị trí robot, vị trí thùng, node cha, các nước đi của cú đẩy này
+# (mỗi nước đi là (chỉ số robot, tên hướng))
+Node = namedtuple("Node", "robots boxes parent moves")
 
 
 def solve(initial_state, timebound=120):
+    #Trả về SokobanState đích (có chuỗi parent hợp lệ), hoặc False nếu hết giờ / vô nghiệm.
     if timebound <= 0:
         return False
-    end = time.time() + timebound
-    init = initial_state
-    if sokoban_goal_state(init):
-        return init
+    deadline = time.time() + timebound
+    if sokoban_goal_state(initial_state):
+        return initial_state
 
-    wd, ht, obs, sto = init.width, init.height, init.obstacles, init.storage
+    width, height = initial_state.width, initial_state.height
+    obstacles, storage = initial_state.obstacles, initial_state.storage
 
-    def free(c):
-        return 0 <= c[0] < wd and 0 <= c[1] < ht and c not in obs
+    def is_open(cell):
+        #Ô nằm trong bàn và không phải tường
+        return 0 <= cell[0] < width and 0 <= cell[1] < height and cell not in obstacles
+        #BFS ngược: khoảng cách đẩy
+    # Từ mỗi ô đích, kéo thùng lùi lại. Ô nào chạm tới được thì thùng ở đó có thể về đích.
+    storage_list = sorted(storage)
+    push_distance = []                       # push_distance[k][ô] = số cú đẩy tới đích thứ k
+    for goal in storage_list:
+        distance = {goal: 0}
+        queue = deque([goal])
+        while queue:
+            box_cell = queue.popleft()
+            for _, step_x, step_y in DIRECTIONS:
+                before = (box_cell[0] - step_x, box_cell[1] - step_y)   # thùng trước khi bị đẩy
+                pusher = (before[0] - step_x, before[1] - step_y)       # chỗ robot đứng
+                if before not in distance and is_open(before) and is_open(pusher):
+                    distance[before] = distance[box_cell] + 1
+                    queue.append(before)
+        push_distance.append(distance)
 
-    # khoang cach day tu moi o toi dich (BFS nguoc); o khong co = o chet
-    pdist = {}                           # list khoang cach toi tung dich
-    sto_list = sorted(sto)
-    for k, s in enumerate(sto_list):
-        dist = {s: 0}
-        q = deque([s])
-        while q:
-            b = q.popleft()
-            for _, dx, dy in DIRS:
-                a = (b[0] - dx, b[1] - dy)           # thung truoc khi bi day
-                p = (a[0] - dx, a[1] - dy)           # cho robot dung
-                if a not in dist and free(a) and free(p):
-                    dist[a] = dist[b] + 1
-                    q.append(a)
-        pdist[k] = dist
-    cost = {}                            # tuple chi phi toi tung dich
-    for x in range(wd):
-        for y in range(ht):
-            row = tuple(pdist[k].get((x, y), INF) for k in range(len(sto_list)))
-            if min(row) < INF:
-                cost[(x, y)] = row
-    alive = cost                         # o song = co trong cost
+    # cost_to_goals[ô] = (số cú đẩy tới đích 0, đích 1, ...). Ô không có trong bảng = ô chết.
+    cost_to_goals = {}
+    for x in range(width):
+        for y in range(height):
+            row = tuple(d.get((x, y), INFINITY) for d in push_distance)
+            if min(row) < INFINITY:
+                cost_to_goals[(x, y)] = row
+    alive_cells = cost_to_goals
 
-    # heuristic = gan cap nho nhat (DP bitmask), cache theo tap thung
-    m = len(sto_list)
-    hcache = {}
+    if any(box not in alive_cells for box in initial_state.boxes):
+        return False                         # có thùng ở ô chết ngay từ đầu: vô nghiệm
 
-    def h(boxes):
-        r = hcache.get(boxes)
-        if r is not None:
-            return r
-        rows = [cost[b] for b in boxes]
-        dp = {0: 0}
-        for row in rows:
-            nd = {}
-            for mask, v in dp.items():
-                for j in range(m):
-                    if not mask >> j & 1:
-                        nm, nv = mask | 1 << j, v + row[j]
-                        if nv < nd.get(nm, INF):
-                            nd[nm] = nv
-            dp = nd
-        r = min(dp.values()) if dp else INF
-        hcache[boxes] = r
-        return r
+    #Heuristic: ghép cặp thùng - đích
+    goal_count = len(storage_list)
+    heuristic_cache = {}
 
-    def frozen(b, boxes, seen):
-        # thung b co bi ket vinh vien (khong day duoc theo ca 2 truc) khong?
-        seen = seen | {b}
-        for dx, dy in ((1, 0), (0, 1)):
-            n1, n2 = (b[0] - dx, b[1] - dy), (b[0] + dx, b[1] + dy)
-            if not free(n1) or not free(n2):
-                continue                                  # tuong chan truc nay
-            if n1 not in alive and n2 not in alive:
-                continue                                  # ca 2 phia la o chet
-            if (n1 in boxes and (n1 in seen or frozen(n1, boxes, seen))) or \ (n2 in boxes and (n2 in seen or frozen(n2, boxes, seen))):
-                continue                                  # thung ke ben bi ket
-            return False                                  # truc nay con di duoc
+    def estimate_remaining(boxes):
+        """Tổng khoảng cách đẩy nhỏ nhất khi mỗi thùng chiếm một ô đích riêng."""
+        cached = heuristic_cache.get(boxes)
+        if cached is not None:
+            return cached
+        # quy hoạch động: best_by_mask[mask] = chi phí nhỏ nhất khi các đích trong mask đã dùng
+        best_by_mask = {0: 0}
+        for box in boxes:
+            row = cost_to_goals[box]
+            next_best = {}
+            for mask, total in best_by_mask.items():
+                for goal in range(goal_count):
+                    if not (mask >> goal) & 1:
+                        new_mask, new_total = mask | (1 << goal), total + row[goal]
+                        if new_total < next_best.get(new_mask, INFINITY):
+                            next_best[new_mask] = new_total
+            best_by_mask = next_best
+        result = min(best_by_mask.values()) if best_by_mask else INFINITY
+        heuristic_cache[boxes] = result
+        return result
+
+    #Phát hiện deadlock (thùng kẹt vĩnh viễn)
+    def is_frozen(box, boxes, visited):
+        #Thùng có bị kẹt vĩnh viễn (không đẩy được theo cả 2 trục) không?
+        visited = visited | {box}
+        for step_x, step_y in ((1, 0), (0, 1)):
+            side_a = (box[0] - step_x, box[1] - step_y)
+            side_b = (box[0] + step_x, box[1] + step_y)
+            if not is_open(side_a) or not is_open(side_b):
+                continue                                    # tường chặn trục này
+            if side_a not in alive_cells and side_b not in alive_cells:
+                continue                                    # cả 2 phía là ô chết
+            a_blocked = side_a in boxes and (side_a in visited or is_frozen(side_a, boxes, visited))
+            b_blocked = side_b in boxes and (side_b in visited or is_frozen(side_b, boxes, visited))
+            if a_blocked or b_blocked:
+                continue                                    # thùng kề bên cũng bị kẹt
+            return False                                    # trục này vẫn còn đi được
         return True
 
-    def deadlock(t, boxes):
-        # sau khi day thung toi t: co thung nao NGOAI dich bi ket vinh vien khong
-        for c in ((t[0], t[1]), (t[0] + 1, t[1]), (t[0] - 1, t[1]),
-                  (t[0], t[1] + 1), (t[0], t[1] - 1)):
-            if c in boxes and c not in sto and frozen(c, boxes, frozenset()):
+    def creates_deadlock(pushed_to, boxes):
+        #Sau khi đẩy thùng tới pushed_to: có thùng nào NGOÀI đích bị kẹt vĩnh viễn không?
+        x, y = pushed_to
+        for cell in ((x, y), (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if cell in boxes and cell not in storage and is_frozen(cell, boxes, frozenset()):
                 return True
         return False
 
-    if any(b not in alive for b in init.boxes):
-        return False                     # co thung o o chet tu dau: vo nghiem
+    #BFS đi bộ của một robot
+    def walk_tree(start, blocked):
+        """BFS từ start. Trả về {ô: (ô trước đó, tên hướng)} cho mọi ô robot tới được."""
+        came_from = {start: None}
+        queue = deque([start])
+        while queue:
+            cell = queue.popleft()
+            for direction_name, step_x, step_y in DIRECTIONS:
+                neighbor = (cell[0] + step_x, cell[1] + step_y)
+                if neighbor not in came_from and is_open(neighbor) and neighbor not in blocked:
+                    came_from[neighbor] = (cell, direction_name)
+                    queue.append(neighbor)
+        return came_from
 
-    # BFS di bo cua 1 robot (thung, tuong, robot khac la vat can)
-    def bfs(start, blocked):
-        prev = {start: None}
-        q = deque([start])
-        while q:
-            c = q.popleft()
-            for name, dx, dy in DIRS:
-                n = (c[0] + dx, c[1] + dy)
-                if n not in prev and free(n) and n not in blocked:
-                    prev[n] = (c, name)
-                    q.append(n)
-        return prev
+    def path_to(came_from, target):
+        #Dựng danh sách hướng đi từ điểm xuất phát tới target.
+        directions = []
+        while came_from[target] is not None:
+            target, direction_name = came_from[target]
+            directions.append(direction_name)
+        directions.reverse()
+        return directions
 
-    def walk(prev, cell):
-        out = []
-        while prev[cell] is not None:
-            cell, name = prev[cell]
-            out.append(name)
-        out.reverse()
-        return out
+    #A* trên các cú đẩy
+    def search(weight, upper_bound, time_limit):
+        """A* với f = g + weight * h. Bỏ mọi nhánh không thể tốt hơn upper_bound.
+        Trả về (tổng bước, node đích) hoặc None nếu hết giờ / không tìm được."""
+        tie_breaker = count()
+        start = Node(initial_state.robots, initial_state.boxes, None, ())
+        open_heap = [(weight * estimate_remaining(start.boxes), 0, next(tie_breaker), 0, start)]
+        best_cost = {(tuple(sorted(start.robots)), start.boxes): 0}
 
-    # A* tren cac cu day; ub = can tren (tong buoc cua loi giai tot nhat da co)
-    def astar(w, ub, deadline):
-        tie = count()
-        r0, b0 = init.robots, init.boxes
-        root = (r0, b0, None, ())                 # (robots, boxes, node_cha, nuoc_di)
-        heap = [(w * h(b0), 0, next(tie), 0, root)]
-        best = {(tuple(sorted(r0)), b0): 0}
-        while heap:
-            if time.time() >= deadline:
+        while open_heap:
+            if time.time() >= time_limit:
                 return None
-            _, _, _, g, node = heapq.heappop(heap)
-            robots, boxes = node[0], node[1]
-            if g > best[(tuple(sorted(robots)), boxes)]:
-                continue
-            if all(b in sto for b in boxes):
-                return g, node
-            rset = set(robots)
-            reach = [bfs(r, boxes | obs | (rset - {r})) for r in robots]
-            for b in boxes:
-                for name, dx, dy in DIRS:
-                    t = (b[0] + dx, b[1] + dy)
-                    if t not in alive or t in boxes or t in rset:
+            _, _, _, cost_so_far, node = heapq.heappop(open_heap)
+            robots, boxes = node.robots, node.boxes
+            if cost_so_far > best_cost[(tuple(sorted(robots)), boxes)]:
+                continue                                    # bản ghi cũ, đã có đường rẻ hơn
+            if all(box in storage for box in boxes):
+                return cost_so_far, node
+
+            robot_cells = set(robots)
+            reachable = [walk_tree(r, boxes | obstacles | (robot_cells - {r})) for r in robots]
+
+            for box in boxes:
+                for direction_name, step_x, step_y in DIRECTIONS:
+                    box_target = (box[0] + step_x, box[1] + step_y)
+                    if box_target not in alive_cells or box_target in boxes or box_target in robot_cells:
                         continue
-                    p = (b[0] - dx, b[1] - dy)    # cho robot phai dung de day
-                    nb = (boxes - {b}) | {t}
-                    if deadlock(t, nb):
+                    pusher_cell = (box[0] - step_x, box[1] - step_y)    # chỗ robot phải đứng
+                    new_boxes = (boxes - {box}) | {box_target}
+                    if creates_deadlock(box_target, new_boxes):
                         continue
-                    hv = h(nb)
-                    for i in range(len(robots)):
-                        if p not in reach[i]:
+                    h_value = estimate_remaining(new_boxes)
+
+                    for i in range(len(robots)):                        # thử từng robot
+                        if pusher_cell not in reachable[i]:
                             continue
-                        steps = walk(reach[i], p)
-                        ng = g + len(steps) + 1
-                        if ng + hv >= ub:         # khong the tot hon loi giai da co
-                            continue
-                        nr = robots[:i] + (b,) + robots[i + 1:]
-                        k = (tuple(sorted(nr)), nb)
-                        if ng < best.get(k, INF):
-                            best[k] = ng
-                            mv = tuple((i, s) for s in steps) + ((i, name),)
-                            heapq.heappush(heap, (ng + w * hv, hv, next(tie), ng,
-                                                  (nr, nb, node, mv)))
+                        walking = path_to(reachable[i], pusher_cell)
+                        new_cost = cost_so_far + len(walking) + 1       # đi bộ + 1 cú đẩy
+                        if new_cost + h_value >= upper_bound:
+                            continue                                    # không thể thắng lời giải đã có
+                        new_robots = robots[:i] + (box,) + robots[i + 1:]
+                        state_key = (tuple(sorted(new_robots)), new_boxes)
+                        if new_cost < best_cost.get(state_key, INFINITY):
+                            best_cost[state_key] = new_cost
+                            move_list = tuple((i, d) for d in walking) + ((i, direction_name),)
+                            heapq.heappush(open_heap, (
+                                new_cost + weight * h_value, h_value, next(tie_breaker),
+                                new_cost, Node(new_robots, new_boxes, node, move_list)))
         return None
 
-    # luot 1: W lon de co loi giai nhanh (phai xong trong timebound)
-    t0 = time.time()
-    found = astar(FAST_W, INF, end)
+    # Lượt 1: W lớn để có lời giải nhanh (phải xong trong timebound)
+    first_start = time.time()
+    found = search(FAST_W, INFINITY, deadline)
     if found is None:
         return False
-    best_g, best_node = found
-    # cac luot sau: giam W de rut ngan loi giai. Bai de (luot dau xong nhanh) -> tinh chinh ngan
-    budget = min(REFINE, max(0.2, 20 * (time.time() - t0)))
-    refine_end = min(end, time.time() + budget)
-    for w in REFINE_W:
-        res = astar(w, best_g, refine_end)
-        if res is not None and res[0] < best_g:
-            best_g, best_node = res
-        if time.time() >= refine_end:
+    best_total, best_node = found
+
+    # Các lượt sau: giảm W để rút ngắn lời giải.
+    # Bài dễ (lượt đầu xong nhanh) -> tinh chỉnh ngắn; bài khó -> tối đa REFINE giây.
+    refine_budget = min(REFINE, max(0.2, 20 * (time.time() - first_start)))
+    refine_deadline = min(deadline, time.time() + refine_budget)
+    for weight in REFINE_W:
+        result = search(weight, best_total, refine_deadline)
+        if result is not None and result[0] < best_total:
+            best_total, best_node = result
+        if time.time() >= refine_deadline:
             break
-    return replay(init, best_node)
+    return replay(initial_state, best_node)
 
-
-def replay(init, node):
-    """Dung lai chuoi nuoc di qua successors() cua giao vien -> parent/action/gval that."""
-    chain = []
+#cấy ni thầy yêu cầu truy ngược về nên giữ nhé
+def replay(initial_state, goal_node):
+    #Chạy lại chuỗi nước đi qua successors() của giáo viên -> parent/action/gval thật.
+    moves_per_push = []
+    node = goal_node
     while node is not None:
-        chain.append(node[3])
-        node = node[2]
-    cur = init
-    for mv in reversed(chain):
-        for i, name in mv:
-            want = "%d %s" % (i, name)
-            cur = next(s for s in cur.successors() if s.action == want)
-    return cur
+        moves_per_push.append(node.moves)
+        node = node.parent
+    current = initial_state
+    for moves in reversed(moves_per_push):
+        for robot_index, direction_name in moves:
+            wanted_action = "%d %s" % (robot_index, direction_name)
+            current = next(s for s in current.successors() if s.action == wanted_action)
+    return current
+
+
+
+#in đường đi, đoạn ni k liên quan đến code, cmay bỏ qua cũng được   
+def get_path(final_state):
+    """Danh sách các state từ trạng thái đầu tới đích (đi ngược theo parent)."""
+    states = []
+    while final_state is not None:
+        states.append(final_state)
+        final_state = final_state.parent
+    states.reverse()
+    return state_string
+
+
+def print_path(final_state, show_map=False):
+    """In từng bước: robot nào đi hướng nào, bước nào là ĐẨY thùng. show_map=True in thêm bản đồ."""
+    states = get_path(final_state)
+    print("Tổng số bước: %d" % final_state.gval)
+    if show_map:
+        print(states[0].state_string())
+    for step_number, (before, after) in enumerate(zip(states, states[1:]), start=1):
+        pushed = after.boxes != before.boxes
+        robot_index, direction_name = after.action.split()
+        note = "  <-- ĐẨY THÙNG" if pushed else ""
+        print("Bước %3d: robot %s đi %-5s%s" % (step_number, robot_index, direction_name, note))
+        if show_map:
+            print(after.state_string())
